@@ -1,0 +1,118 @@
+################################################################################
+# PROJECT: UNBIASED TRANSCRIPTOMIC DISCOVERY (TCGA-CHOL)
+# PURPOSE: DGE analysis for mRNAs and ncRNAs (Tumor vs Normal)
+# AUTHOR: Eiman Meer
+################################################################################
+
+# 1. LOAD REQUIRED LIBRARIES
+if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+pacman::p_load(tidyverse, DESeq2, ggplot2, pheatmap, EnhancedVolcano, AnnotationDbi, org.Hs.eg.db)
+library(dplyr)
+library(readr)
+library(tidyverse)
+library(pheatmap)
+library(EnhancedVolcano)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+# 2. DEFINE PATHS
+clinical_path <- "E:/TCGA_CHOL_Clinical_Data_Cleaned.csv"
+rna_folder    <- "E:/Mon_Apr_27_12_49_25_2026"
+
+# 3. BUILD THE MASTER COUNT MATRIX (44 Patients)
+files <- list.files(rna_folder, pattern = "*.tsv", full.names = TRUE, recursive = TRUE)
+
+cat("Step 1: Reading and Merging 44 RNA-Seq files...\n")
+
+# Explicitly calling dplyr::select fixes the 'inherited method' error
+for (f in files) {
+  # We use the filename as the column header
+  sample_name <- basename(f)
+  
+  # ADD dplyr:: HERE AS WELL
+  temp <- read_tsv(f, skip = 1) %>% 
+    dplyr::select(gene_id, unstranded)
+  
+  colnames(temp)[2] <- sample_name
+  raw_data <- left_join(raw_data, temp, by = "gene_id")
+}
+# Explicitly use dplyr::select to remove the metadata columns
+countData <- counts_matrix %>% 
+  dplyr::select(-gene_name, -gene_type) %>% 
+  round()
+
+# 5. PREPARE COLDATA (Metadata for Design)
+colData <- data.frame(
+  sample_id = colnames(countData),
+  condition = ifelse(grepl("-01", colnames(countData)), "Tumor", "Normal")
+) %>% column_to_rownames("sample_id")
+
+colData$condition <- factor(colData$condition, levels = c("Normal", "Tumor"))
+library(DESeq2)
+# 6. RUN THE UNBIASED DGE ANALYSIS
+cat("Step 2: Running DESeq2 (Negative Binomial Model)...\n")
+dds <- DESeqDataSetFromMatrix(countData = countData, colData = colData, design = ~ condition)
+dds <- dds[rowSums(counts(dds)) > 10, ] # Filter low expression genes
+dds <- DESeq(dds)
+res <- results(dds)
+
+# 7. ANNOTATE RESULTS WITH BIOTYPES
+res_df <- as.data.frame(res) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(raw_data %>% dplyr::select(gene_id, gene_name, gene_type), by = "gene_id") %>%
+  arrange(padj)
+
+# 8. EXPORT TOP RESULTS
+write.csv(res_df, "E:/TCGA_CHOL_Discovery_DGE_Full.csv", row.names = FALSE)
+
+# Filter for High Significance (Potential Axis Players)
+sig_genes <- res_df %>% filter(padj < 0.01 & abs(log2FoldChange) > 2)
+write.csv(sig_genes, "E:/TCGA_CHOL_Significant_DEGs.csv", row.names = FALSE)
+
+# 9. VISUALIZATION (Volcano Plot)
+# Note: This will label the top hits (mRNAs, lncRNAs, and miRNAs)
+EnhancedVolcano(res_df,
+                lab = res_df$gene_name,
+                x = 'log2FoldChange',
+                y = 'padj',
+                title = 'Transcriptomic Discovery: Tumor vs Normal',
+                subtitle = 'Unbiased Screen of 44 Libraries',
+                pCutoff = 0.01,
+                FCcutoff = 2.0,
+                pointSize = 3.0,
+                labSize = 4.0)
+
+ggsave("E:/Volcano_Plot_Discovery.png", width = 8, height = 8)
+
+cat("ANALYSIS COMPLETE. Matrix and Discovery Results saved to E: drive.\n")
+View(res_df)
+# Filter for genes with Adjusted P-value < 0.01 and high fold change
+sig_list <- res_df %>% 
+  filter(padj < 0.01 & abs(log2FoldChange) > 2)
+# Look at the top 20
+head(sig_list, 20)
+# ==============================================================================
+# PHASE 3: CORRELATION ANALYSIS (BUILDING THE AXIS)
+# ==============================================================================
+
+# 1. Get Normalized Transformation (VST)
+vsd <- vst(dds, blind = FALSE)
+vst_matrix <- assay(vsd)
+
+# 2. Pick the candidates from your 'sig_list'
+# Let's pick the top 5 lncRNAs and top 5 mRNAs based on significance
+top_lnc_ids <- sig_list %>% filter(gene_type == "lncRNA") %>% head(5) %>% pull(gene_id)
+top_m_ids   <- sig_list %>% filter(gene_type == "protein_coding") %>% head(5) %>% pull(gene_id)
+
+# 3. Create a small matrix for just these candidates
+axis_data <- t(vst_matrix[c(top_lnc_ids, top_m_ids), ])
+
+# 4. Calculate Spearman Correlation
+# This tells us which lncRNA and mRNA move together
+cor_results <- cor(axis_data, method = "spearman")
+
+# 5. Visualize the Axis with a Heatmap
+library(pheatmap)
+pheatmap(cor_results, 
+         main = "Regulatory Axis Correlation (lncRNA vs mRNA)",
+         display_numbers = TRUE,
+         color = colorRampPalette(c("blue", "white", "red"))(100))
